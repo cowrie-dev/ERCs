@@ -41,6 +41,8 @@ interface IPayoutRace /* is IERC165 */ {
 
     /// @notice Purchase a listed asset for the fixed global price.
     /// @param expectedPaymentAmount equality guard against config churn
+    /// @dev MUST revert if the asset is not currently listed. MUST update state before any external calls.
+    /// @dev Implementations MUST transfer exactly paymentAmount() of paymentToken() from msg.sender to paymentReceiver().
     function purchase(
         bytes32 assetId,
         address recipient,
@@ -81,7 +83,9 @@ interface IAssetHandler {
 ### Introspection
 
 ```solidity
-function getHandler(bytes32 assetId) external view returns (address handler, bytes32 key);
+interface IPayoutRaceIntrospection /* is IERC165 */ {
+    function getHandler(bytes32 assetId) external view returns (address handler, bytes32 key);
+}
 ```
 
 Optional extension:
@@ -101,6 +105,13 @@ The `key` is an opaque identifier interpreted by the handler. Implementers are e
 * Arbitrary selector: use the `key` to discriminate between multiple behaviors inside a single handler without additional storage.
 
 This pattern keeps the core ERC generic. The Uniswap V3 example below demonstrates address packing, but the same approach applies to any protocol that needs to route a purchase to a specific destination.
+
+### Interfaces used by reference handlers
+
+```solidity
+interface IERC20 { function transfer(address to, uint256 value) external returns (bool); }
+interface IERC777 { function send(address to, uint256 amount, bytes calldata data) external; }
+```
 
 ---
 
@@ -216,7 +227,7 @@ Implementers that prefer explicit storage can keep a mapping `key → pool` and 
 
 Implementations MUST:
 
-* Follow **Checks–Effects–Interactions (CEI)**: update state (delist asset, update accounting, emit events) before calling `transferFrom` or `fulfill`.
+* Follow **Checks-Effects-Interactions (CEI)**: update state (delist asset, update accounting, emit events) before calling `transferFrom` or `fulfill`.
 * Use a **reentrancy guard** on `purchase`.
 * Require that `paymentToken` is a plain ERC-20 (no ERC-777 hooks, no fee-on-transfer). If unsafe, revert with `UnsafePaymentToken`.
 * Note that handlers may transfer ERC-777 or ETH, which can trigger recipient callbacks. Since state is updated first, this is safe.
