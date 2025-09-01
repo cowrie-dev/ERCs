@@ -11,7 +11,7 @@ This ERC defines a minimal standard for contracts that sell discrete **assets** 
 The Uniswap Foundation’s UniStaker project describes a "payout race" mechanism in which a claimer pays a fixed amount of UNI to collect Uniswap V3 pool fees for distribution to UNI stakers. This ERC generalizes that pattern:
 
 * There is a single bucket of assets, with a single contract entrypoint for discovery and execution of purchases.
-* A global paymentToken and paymentAmount are defined by the owner.
+* A global paymentToken, paymentAmount, and paymentSink are defined by the owner.
 * Searchers can purchase specific assets, one at a time.
 * Fulfillment is pluggable via handlers, so different asset types slot into the same standard.
 
@@ -19,7 +19,7 @@ This enables:
 
 * Reusable infrastructure across protocols.
 * Open-ended fulfillment (e.g. calling a Uniswap V3 pool’s `claimFees`, or transferring ERC-20s).
-* Simple, race-based UX: “pay X units of paymentToken, atomically get asset Y.”
+* Simple, race-based UX: "pay X units of paymentToken, atomically get asset Y."
 
 ---
 
@@ -32,7 +32,15 @@ interface IPayoutRace /* is IERC165 */ {
     // Global payment configuration (ERC-20 only)
     function paymentToken() external view returns (address);
     function paymentAmount() external view returns (uint256);
-    function paymentReceiver() external view returns (address);
+    function paymentSink() external view returns (address);
+
+    // Admin setters
+    /// @notice Update payment token used for purchases
+    function setPaymentToken(address token) external;
+    /// @notice Update fixed payment amount denominated in paymentToken
+    function setPaymentAmount(uint256 amount) external;
+    /// @notice Update sink that receives paymentToken upon purchase
+    function setPaymentSink(address sink) external;
 
     // Asset discovery
     function assetExists(bytes32 assetId) external view returns (bool);
@@ -42,7 +50,7 @@ interface IPayoutRace /* is IERC165 */ {
     /// @notice Purchase a listed asset for the fixed global price.
     /// @param expectedPaymentAmount equality guard against config churn
     /// @dev MUST revert if the asset is not currently listed. MUST update state before any external calls.
-    /// @dev Implementations MUST transfer exactly paymentAmount() of paymentToken() from msg.sender to paymentReceiver().
+    /// @dev Implementations MUST transfer exactly paymentAmount() of paymentToken() from msg.sender to paymentSink().
     function purchase(
         bytes32 assetId,
         address recipient,
@@ -53,10 +61,13 @@ interface IPayoutRace /* is IERC165 */ {
     function totalPaid() external view returns (uint256);
 
     // Events
-    event PaymentConfigured(address paymentToken, uint256 paymentAmount, address paymentReceiver);
+    /// @notice Emitted after any change to token, amount, or sink
+    event PaymentConfigured(address paymentToken, uint256 paymentAmount, address paymentSink);
     event AssetListed(bytes32 indexed assetId, address indexed handler, bytes32 key);
     event AssetRemoved(bytes32 indexed assetId);
     event AssetPurchased(bytes32 indexed assetId, address indexed buyer, address indexed recipient, uint256 paid);
+
+    // Notes: `AssetRemoved` is intended for administrative unlisting. Implementations SHOULD NOT emit `AssetRemoved` on a successful purchase; use `AssetPurchased` instead.
 
     // Errors
     error UnknownAsset(bytes32 assetId);
@@ -96,6 +107,14 @@ interface IAssetDescribe {
 }
 ```
 
+### ERC-165 conformance
+
+Implementations MUST support ERC-165 for `IPayoutRace`. Optional interfaces, such as `IPayoutRaceIntrospection` and `IAssetDescribe`, SHOULD be discoverable via ERC-165.
+
+### Admin considerations
+
+Access control for setters is intentionally unspecified; EIP-173 ownership or a role-based pattern is recommended.
+
 ### Keys and packed identifiers
 
 The `key` is an opaque identifier interpreted by the handler. Implementers are encouraged to **pack identifiers** needed for fulfillment directly into the `key` to minimize storage and simplify listing. Examples:
@@ -115,7 +134,7 @@ interface IERC777 { function send(address to, uint256 amount, bytes calldata dat
 
 ---
 
-## Reference Handlers
+## Reference Handlers & Examples
 
 ### 1. ERC-20 Transfer Handler
 
@@ -134,7 +153,7 @@ contract ERC20AssetHandler is IAssetHandler {
 
     function fulfill(bytes32 key, address recipient) external override onlyBucket {
         Spec memory s = specs[key];
-        IERC20(s.token).transfer(recipient, s.amount);
+        require(IERC20(s.token).transfer(recipient, s.amount), "ERC20_XFER_FAIL");
         delete specs[key];
     }
 }
@@ -217,9 +236,14 @@ Implementers that prefer explicit storage can keep a mapping `key → pool` and 
 ## Rationale
 
 * **Global fixed price** simplifies integration. Governance can update `paymentAmount` as needed. Buyers guard with `expectedPaymentAmount`.
-* **Per-asset purchase only**: removes ambiguity of “buy all.” Each asset is its own claimable unit.
+* **PaymentSink** centralizes payment routing for accounting and compliance: implementations always deliver payment to `paymentSink()`. The sink can be a treasury, a burn sink, or any receiver.
+* **Per-asset purchase primitive**: the interface specifies purchase of one listed asset per call and intentionally omits a bundled "buy all" entrypoint.
 * **Handlers** allow arbitrary logic (token transfers, claims, etc.). This makes the standard flexible enough for both Uniswap’s pools and simpler ERC-20 rewards.
 * **Separation of concerns**: the bucket tracks listings, payments, and accounting; handlers execute fulfillment.
+
+*Non-normative note on admin rights.* Some deployments may renounce or restrict admin rights for policy or compliance reasons (for example, renouncing ownership or disabling roles). This ERC does not prescribe any specific mechanism.
+
+**Non-normative note on permits.** Implementations MAY offer approvalless purchase flows using the payment token’s native permit mechanism, such as ERC-2612, but this ERC does not standardize a permit interface. If implemented, the contract should validate the permit, require `value == paymentAmount()`, and then execute the same purchase flow defined here.
 
 ---
 
@@ -227,7 +251,7 @@ Implementers that prefer explicit storage can keep a mapping `key → pool` and 
 
 Implementations MUST:
 
-* Follow **Checks-Effects-Interactions (CEI)**: update state (delist asset, update accounting, emit events) before calling `transferFrom` or `fulfill`.
+* Follow **Checks-Effects-Interactions (CEI)**: update state (make `assetId` unavailable for further purchase, update accounting, emit events) before calling `transferFrom` to the sink or invoking `fulfill`.
 * Use a **reentrancy guard** on `purchase`.
 * Require that `paymentToken` is a plain ERC-20 (no ERC-777 hooks, no fee-on-transfer). If unsafe, revert with `UnsafePaymentToken`.
 * Note that handlers may transfer ERC-777 or ETH, which can trigger recipient callbacks. Since state is updated first, this is safe.
